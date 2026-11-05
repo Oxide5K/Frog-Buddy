@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = "0.29"
 tray-icon = "0.26.1"
-windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_System_SystemInformation"] }
 
 [profile.release]
 strip = true
