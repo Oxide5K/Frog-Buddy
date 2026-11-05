@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "frog-buddy"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "eframe",
  "tray-icon",

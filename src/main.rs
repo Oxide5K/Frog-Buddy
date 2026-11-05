@@ -238,6 +238,18 @@ fn ribbit_wav(volume: u32) -> Vec<u8> {
     wav
 }
 
+/// 0..n in random order (Fisher-Yates driven by xorshift64; no need for a rand dependency).
+fn shuffled(n: usize, rng: &mut u64) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        v.swap(i, (*rng % (i as u64 + 1)) as usize);
+    }
+    v
+}
+
 fn default_tips(european: bool) -> Vec<String> {
     REMINDERS
         .iter()
@@ -339,7 +351,10 @@ struct State {
     shown_at: Instant,
     next_at: Instant,
     settings: bool,
-    idx: usize,
+    // Shuffle bag of tip positions still to show; every tip appears once before any repeats.
+    bag: Vec<usize>,
+    last_tip: Option<usize>,
+    rng: u64,
     quit: bool,
     monitor: Option<Vec2>,
     tips: Option<Vec<String>>,
@@ -367,9 +382,17 @@ impl State {
             }
             _ => default_tips(self.cfg.european),
         };
-        let tip = list[self.idx % list.len()].clone();
-        self.idx += 1;
-        self.show_tip(tip);
+        // an edited list can leave stale positions in the bag, so refill whenever one is out of range
+        if self.bag.is_empty() || self.bag.iter().any(|&i| i >= list.len()) {
+            self.bag = shuffled(list.len(), &mut self.rng);
+            // don't repeat the tip just shown across a reshuffle (bag pops from the end)
+            if self.bag.len() > 1 && self.bag.last() == self.last_tip.as_ref() {
+                self.bag.swap(0, list.len() - 1);
+            }
+        }
+        let i = self.bag.pop().unwrap();
+        self.last_tip = Some(i);
+        self.show_tip(list[i].clone());
     }
 
     fn show_tip(&mut self, tip: String) {
@@ -1101,8 +1124,10 @@ fn main() -> eframe::Result {
         shown_at: Instant::now(),
         next_at: Instant::now() + Duration::from_secs(cfg.minutes as u64 * 60),
         settings: false,
-        idx: 0,
-        quit: false,
+        bag: Vec::new(),
+        last_tip: None,
+        // seed from the clock so each launch starts somewhere different; `| 1` keeps xorshift off zero
+        rng: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) | 1,        quit: false,
         monitor: None,
         tips: load_tips(),
         schedule: load_schedule(),
@@ -1191,6 +1216,17 @@ mod tests {
         assert!(ver("v1.0.1") > ver("1.0.0"));
         assert!(ver("v1.10.0") > ver("1.9.9"));
         assert!(ver("v1.0.0") <= ver("1.0.0"));
+    }
+
+    #[test]
+    fn shuffle_covers_every_tip_once() {
+        let mut rng = 12345;
+        for n in [0, 1, 2, 10] {
+            let mut v = shuffled(n, &mut rng);
+            v.sort();
+            assert_eq!(v, (0..n).collect::<Vec<_>>());
+        }
+        assert_ne!(shuffled(10, &mut rng), shuffled(10, &mut rng));
     }
 
     #[test]
