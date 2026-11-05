@@ -11,13 +11,10 @@ use std::time::{Duration, Instant};
 const RELEASES: &str = "https://github.com/Oxide5K/Frog-Buddy/releases/latest";
 
 const W: f32 = 280.0;
-const H: f32 = 270.0;
+const H: f32 = 310.0;
 const MARGIN: f32 = 12.0;
 // shortcut: fixed taskbar allowance instead of querying the real work area; upgrade if taskbar is moved/resized
 const TASKBAR: f32 = 48.0;
-// Bubble's bottom edge, just above the frog's eyes.
-const BUBBLE_BOTTOM: f32 = H - 104.0;
-const SHOW_FOR: Duration = Duration::from_secs(20);
 
 // (US wording, European wording)
 const REMINDERS: &[(&str, &str)] = &[
@@ -40,11 +37,12 @@ struct Config {
     corner: usize,
     minutes: u32,
     european: bool,
+    show_secs: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { corner: 3, minutes: 30, european: false }
+        Self { corner: 3, minutes: 30, european: false, show_secs: 20 }
     }
 }
 
@@ -55,6 +53,7 @@ impl Config {
             match line.split_once('=') {
                 Some(("corner", v)) => c.corner = v.trim().parse().unwrap_or(c.corner).min(3),
                 Some(("minutes", v)) => c.minutes = v.trim().parse().unwrap_or(c.minutes).clamp(1, 240),
+                Some(("show_secs", v)) => c.show_secs = v.trim().parse().unwrap_or(c.show_secs).clamp(5, 300),
                 Some(("units", v)) => c.european = v.trim() == "european",
                 _ => {}
             }
@@ -74,9 +73,10 @@ impl Config {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
             let _ = std::fs::write(p, format!(
-                "corner={}\nminutes={}\nunits={}\n",
+                "corner={}\nminutes={}\nshow_secs={}\nunits={}\n",
                 self.corner,
                 self.minutes,
+                self.show_secs,
                 if self.european { "european" } else { "us" }
             ));
         }
@@ -126,7 +126,7 @@ fn start_installer() -> Result<(), String> {
 }
 
 struct State {
-    show_id: tray_icon::menu::MenuId,
+    settings_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
     update_rx: Option<Receiver<Option<String>>>,
     update: Option<String>,
@@ -141,22 +141,28 @@ struct State {
 }
 
 impl State {
-    fn visible(&self) -> bool {
-        self.message.is_some() || self.settings || self.update.is_some()
+    fn frog_visible(&self) -> bool {
+        self.message.is_some() || self.update.is_some()
     }
 
     fn hide(&mut self) {
         self.message = None;
-        self.settings = false;
         self.next_at = Instant::now() + Duration::from_secs(self.cfg.minutes as u64 * 60);
     }
 
-    /// Handles tray clicks, update results and due reminders; shared by the window and the idle loop.
+    fn remind_now(&mut self) {
+        let (us, eu) = REMINDERS[self.idx % REMINDERS.len()];
+        self.message = Some(if self.cfg.european { eu } else { us }.into());
+        self.idx += 1;
+        self.shown_at = Instant::now();
+    }
+
+    /// Handles tray clicks, update results and due reminders; shared by both windows and the idle loop.
     fn poll(&mut self) {
         while let Ok(e) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if e.id == self.quit_id {
                 self.quit = true;
-            } else if e.id == self.show_id {
+            } else if e.id == self.settings_id {
                 self.settings = true;
             }
         }
@@ -165,13 +171,10 @@ impl State {
             self.update = tag;
         }
         let now = Instant::now();
-        if !self.visible() && now >= self.next_at {
-            let (us, eu) = REMINDERS[self.idx % REMINDERS.len()];
-            self.message = Some(if self.cfg.european { eu } else { us }.into());
-            self.idx += 1;
-            self.shown_at = now;
+        if !self.frog_visible() && now >= self.next_at {
+            self.remind_now();
         }
-        if self.message.is_some() && !self.settings && self.update.is_none() && now - self.shown_at > SHOW_FOR {
+        if self.message.is_some() && self.update.is_none() && now - self.shown_at > Duration::from_secs(self.cfg.show_secs as u64) {
             self.hide();
         }
     }
@@ -184,50 +187,309 @@ impl State {
     }
 }
 
-/// One on-screen session; the window is destroyed as soon as there is nothing to show.
+/// One window session (the frog or the settings menu); destroyed as soon as it has nothing to show.
 struct Frog {
     st: Rc<RefCell<State>>,
+    settings_mode: bool,
     placed: Option<usize>,
     bubble: Vec2,
-    frog: Option<egui::TextureHandle>,
+    frog: Option<[egui::TextureHandle; 2]>,
 }
 
 // 22x22 RGBA sprite cut from the frog art (assets/frog.png is the same image).
 const FROG_PX: usize = 22;
-const FROG_SCALE: f32 = 4.0;
+// Screen pixels per art pixel. Not a whole number, so cell edges are snapped to whole pixels to stay crisp.
+const CELL: f32 = 3.4;
 const INK: Color32 = Color32::BLACK;
+const PAPER: Color32 = Color32::from_rgb(252, 252, 240);
+// Eye boxes in the sprite (columns) and the rows they span; used to draw the blink frame.
+const EYES: [std::ops::RangeInclusive<usize>; 2] = [5..=8, 13..=16];
+const EYE_ROWS: std::ops::RangeInclusive<usize> = 2..=5;
+
+/// Open-eye and closed-eye frames of the frog sprite.
+fn frog_frames() -> [egui::ColorImage; 2] {
+    let open = include_bytes!("../assets/frog.rgba");
+    let mut shut = open.to_vec();
+    let px = |r: usize, c: usize| (r * FROG_PX + c) * 4;
+    let lid: [u8; 4] = shut[px(6, 6)..px(6, 6) + 4].try_into().unwrap();
+    for cols in EYES {
+        for r in EYE_ROWS {
+            for c in cols.clone() {
+                let colour = if r == 4 { [0, 0, 0, 255] } else { lid };
+                shut[px(r, c)..px(r, c) + 4].copy_from_slice(&colour);
+            }
+        }
+    }
+    [open.as_slice(), shut.as_slice()].map(|b| egui::ColorImage::from_rgba_unmultiplied([FROG_PX, FROG_PX], b))
+}
 
 fn pixel_style(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("pixel".into(), egui::FontData::from_static(include_bytes!("../assets/PressStart2P-Regular.ttf")));
+    fonts.font_data.insert("pixel".into(), egui::FontData::from_static(include_bytes!("../assets/Jersey10-Regular.ttf")));
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.get_mut(&fam).unwrap().insert(0, "pixel".into());
     }
     ctx.set_fonts(fonts);
     ctx.set_visuals(egui::Visuals::light());
     ctx.style_mut(|s| {
-        s.text_styles.iter_mut().for_each(|(_, f)| f.size = 9.0);
-        s.spacing.item_spacing = Vec2::new(6.0, 7.0);
+        s.text_styles.iter_mut().for_each(|(_, f)| f.size = 20.0);
+        s.spacing.item_spacing = Vec2::new(6.0, 5.0);
+        s.spacing.button_padding = Vec2::new(8.0, 1.0);
         let w = &mut s.visuals.widgets;
         for v in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
             v.rounding = egui::Rounding::ZERO;
+            v.fg_stroke.color = INK;
         }
         w.inactive.bg_stroke = Stroke::new(2.0, INK);
         w.hovered.bg_stroke = Stroke::new(2.0, INK);
+        w.active.bg_stroke = Stroke::new(2.0, INK);
         w.inactive.weak_bg_fill = Color32::from_rgb(200, 230, 120);
+        w.inactive.bg_fill = Color32::from_rgb(200, 230, 120);
         w.hovered.weak_bg_fill = Color32::from_rgb(170, 215, 80);
+        w.hovered.bg_fill = Color32::from_rgb(170, 215, 80);
         s.visuals.selection.bg_fill = Color32::from_rgb(110, 190, 60);
         s.visuals.selection.stroke = Stroke::new(1.0, INK);
+        s.visuals.panel_fill = PAPER;
+        s.visuals.override_text_color = Some(INK);
     });
 }
 
+/// Pixel-art speech bubble: notched corners and a stepped tail pointing down at `tail_x`.
+fn speech_bubble(b: Rect, tail_x: f32) -> Vec<egui::Shape> {
+    const P: f32 = 3.0;
+    let mut out = Vec::new();
+    let mut fill = |r: Rect, c: Color32| out.push(egui::Shape::rect_filled(r, 0.0, c));
+    let px = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
+    fill(b.shrink2(Vec2::new(P, 0.0)), PAPER);
+    fill(b.shrink2(Vec2::new(0.0, P)), PAPER);
+    let (l, t, r, bt) = (b.min.x, b.min.y, b.max.x, b.max.y);
+    fill(px(l + P, t, r - l - 2.0 * P, P), INK);
+    fill(px(l + P, bt - P, r - l - 2.0 * P, P), INK);
+    fill(px(l, t + P, P, bt - t - 2.0 * P), INK);
+    fill(px(r - P, t + P, P, bt - t - 2.0 * P), INK);
+    for (x, y) in [(l + P, t + P), (r - 2.0 * P, t + P), (l + P, bt - 2.0 * P), (r - 2.0 * P, bt - 2.0 * P)] {
+        fill(px(x, y, P, P), INK);
+    }
+    // tail: vertical left edge, stepped right edge, overlapping the bottom border
+    for i in 0..4 {
+        let y = bt - P + i as f32 * P;
+        let w = (4 - i) as f32 * P;
+        fill(px(tail_x, y, w, P), PAPER);
+        fill(px(tail_x, y, P, P), INK);
+        fill(px(tail_x + w - P, y, P, P), INK);
+    }
+    out
+}
+
+/// Little pond with drifting wave highlights and a lily pad; returns where the frog's feet go.
+fn pond(p: &egui::Painter, t: f64, bob: f32) -> Pos2 {
+    let cell = |cx: f32, cy: f32, x: i32, y: i32, c: Color32| {
+        let (x0, y0) = (cx + x as f32 * CELL, cy + y as f32 * CELL);
+        p.rect_filled(Rect::from_min_max(Pos2::new(x0.round(), y0.round()), Pos2::new((x0 + CELL).round(), (y0 + CELL).round())), 0.0, c)
+    };
+    let inside = |x: i32, y: i32, rx: f32, ry: f32| (x as f32 / rx).powi(2) + (y as f32 / ry).powi(2) <= 1.0;
+    let (cx, cy) = (W / 2.0 - CELL / 2.0, H - 26.0);
+    let frame = (t * 4.0) as i32;
+    let (rx, ry) = (31.0, 5.6);
+    for y in -6..=6 {
+        for x in -32..=32 {
+            if !inside(x, y, rx, ry) {
+                continue;
+            }
+            let edge = !inside(x - 1, y, rx, ry) || !inside(x + 1, y, rx, ry) || !inside(x, y - 1, rx, ry) || !inside(x, y + 1, rx, ry);
+            // alternate rows drift in opposite directions
+            let drift = if y % 2 == 0 { frame } else { -frame };
+            let c = if edge {
+                Color32::from_rgb(20, 60, 140)
+            } else if y % 2 != 0 && (x + drift + y * 5).rem_euclid(9) < 2 {
+                Color32::from_rgb(150, 210, 255)
+            } else {
+                Color32::from_rgb(40, 110, 210)
+            };
+            cell(cx, cy, x, y, c);
+        }
+    }
+    let ly = cy - CELL + bob;
+    let (lx, lyr) = (19.0, 3.6);
+    for y in -4..=4 {
+        for x in -20..=20 {
+            // V-shaped notch in the front-right of the pad
+            if !inside(x, y, lx, lyr) || (y > 0 && x > 1 && x < 2 + y * 3) {
+                continue;
+            }
+            let edge = !inside(x, y + 1, lx, lyr) || !inside(x - 1, y, lx, lyr) || !inside(x + 1, y, lx, lyr) || !inside(x, y - 1, lx, lyr);
+            let c = if edge { Color32::from_rgb(30, 90, 30) } else if (x + y) % 7 == 0 { Color32::from_rgb(120, 200, 80) } else { Color32::from_rgb(70, 160, 55) };
+            cell(cx, ly, x, y, c);
+        }
+    }
+    Pos2::new(W / 2.0, ly + CELL * 0.5)
+}
+
+/// Pixel-font text with the extra 1px letter spacing used everywhere in the app.
+fn txt(s: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(s).extra_letter_spacing(1.0)
+}
+
+impl Frog {
+    fn settings_ui(&self, ui: &mut egui::Ui, st: &mut State) {
+        ui.add_space(4.0);
+        ui.label(txt("Frog Buddy Settings").size(30.0));
+        ui.add_space(8.0);
+        let mut changed = false;
+        ui.label(txt("Where should I sit?"));
+        egui::Grid::new("corners").show(ui, |ui| {
+            for (i, name) in CORNERS.iter().enumerate() {
+                if ui.selectable_label(st.cfg.corner == i, txt(*name)).clicked() {
+                    st.cfg.corner = i;
+                    changed = true;
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        egui::Grid::new("timing").spacing(Vec2::new(8.0, 8.0)).show(ui, |ui| {
+            ui.label(txt("Remind me every"));
+            changed |= ui.add(egui::DragValue::new(&mut st.cfg.minutes).range(1..=240).suffix(" min")).changed();
+            ui.end_row();
+            ui.label(txt("Keep tips up for"));
+            changed |= ui.add(egui::DragValue::new(&mut st.cfg.show_secs).range(5..=300).suffix(" sec")).changed();
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        changed |= ui.checkbox(&mut st.cfg.european, txt("European units (ml, metres)")).changed();
+        if changed {
+            st.cfg.save();
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button(txt("Show a tip now")).clicked() {
+                st.remind_now();
+                st.settings = false;
+            }
+            if ui.button(txt("Close")).clicked() {
+                st.settings = false;
+            }
+            if ui.button(txt("Quit")).clicked() {
+                st.quit = true;
+            }
+        });
+        ui.add_space(10.0);
+        ui.label(txt(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(16.0).color(Color32::from_gray(90)));
+    }
+
+    fn frog_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, st: &mut State) {
+        let t = ctx.input(|i| i.time);
+        let bob = if (t * 0.8) as i64 % 2 == 0 { 0.0 } else { 2.0 };
+        let feet = pond(ui.painter(), t, bob);
+
+        let side = (FROG_PX as f32 * CELL).round();
+        let frog_rect = Rect::from_min_size(Pos2::new((feet.x - side / 2.0).round(), (feet.y - side).round()), Vec2::splat(side));
+        let resp = ui.interact(frog_rect, ui.id().with("frog"), Sense::click());
+        let tex = self.frog.get_or_insert_with(|| {
+            let [open, shut] = frog_frames();
+            [ctx.load_texture("frog", open, egui::TextureOptions::NEAREST), ctx.load_texture("frog-blink", shut, egui::TextureOptions::NEAREST)]
+        });
+        // blink for ~150 ms every 4 s, with a double blink every third time
+        let phase = t % 4.0;
+        let blinking = phase < 0.15 || ((t / 4.0) as i64 % 3 == 0 && (0.3..0.45).contains(&phase));
+        ui.painter().image(tex[blinking as usize].id(), frog_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+
+        let bottom = frog_rect.min.y - 16.0;
+        if let (None, Some(m)) = (&st.update, &st.message) {
+            // Plain tips: lay out once and pad around the glyphs' drawn bounds so padding is even on all sides.
+            const PAD: f32 = 12.0;
+            const BORDER: f32 = 3.0;
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = W - 8.0 - 2.0 * (PAD + BORDER);
+            job.append(m, 0.0, egui::TextFormat {
+                font_id: egui::FontId::proportional(22.0),
+                color: INK,
+                extra_letter_spacing: 1.0,
+                line_height: Some(17.0),
+                ..Default::default()
+            });
+            let galley = ctx.fonts(|f| f.layout_job(job));
+            let ink = galley.mesh_bounds;
+            let size = ink.size() + Vec2::splat(2.0 * (PAD + BORDER));
+            let bubble = Rect::from_min_size(Pos2::new(((W - size.x) / 2.0).round(), (bottom - size.y).round()), size.round());
+            ui.painter().extend(speech_bubble(bubble, W / 2.0 - 18.0));
+            ui.painter().galley(bubble.min + Vec2::splat(PAD + BORDER) - ink.min.to_vec2(), galley, INK);
+            if resp.clicked() {
+                st.hide();
+            }
+            return;
+        }
+
+        // Update prompt has buttons, so it uses a normal ui sized from last frame's content (one-frame lag).
+        let size = (self.bubble + Vec2::splat(24.0)).min(Vec2::new(W - 8.0, bottom));
+        let bubble = Rect::from_min_size(Pos2::new((W - size.x) / 2.0, bottom - size.y), size);
+        let bg = ui.painter().add(egui::Shape::Noop);
+        let content = Rect::from_min_size(bubble.min + Vec2::splat(12.0), Vec2::new(W - 32.0, bottom));
+        let used = ui
+            .allocate_new_ui(egui::UiBuilder::new().max_rect(content), |ui| {
+                if let Some(tag) = st.update.clone() {
+                    ui.label(txt(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(22.0).line_height(Some(17.0)));
+                    ui.horizontal(|ui| {
+                        if ui.button(txt("Yes")).clicked() {
+                            match start_installer() {
+                                Ok(()) => st.quit = true,
+                                Err(e) => {
+                                    st.update = None;
+                                    st.message = Some(e);
+                                    st.shown_at = Instant::now();
+                                }
+                            }
+                        }
+                        if ui.button(txt("No")).clicked() {
+                            st.update = None;
+                            st.hide();
+                        }
+                    });
+                } else if let Some(m) = &st.message {
+                    ui.label(egui::RichText::new(m).size(22.0).line_height(Some(17.0)));
+                }
+                ui.min_rect().size()
+            })
+            .inner;
+        ui.painter().set(bg, egui::Shape::Vec(speech_bubble(bubble, W / 2.0 - 18.0)));
+        if (used - self.bubble).length() > 0.5 {
+            self.bubble = used;
+            ctx.request_repaint();
+        }
+
+        if st.update.is_none() && resp.clicked() {
+            st.hide();
+        }
+    }
+}
+
 impl eframe::App for Frog {
-    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4]
+    fn clear_color(&self, v: &egui::Visuals) -> [f32; 4] {
+        if self.settings_mode {
+            v.panel_fill.to_normalized_gamma_f32()
+        } else {
+            [0.0; 4]
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        let mut st = self.st.borrow_mut();
+        let rc = self.st.clone();
+        let mut st = rc.borrow_mut();
+        st.poll();
+        // Each window only lives while its mode is wanted; main() opens the next one.
+        let wanted = if self.settings_mode { st.settings } else { st.frog_visible() && !st.settings };
+        if st.quit || !wanted {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.settings_mode {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).inner_margin(16.0)).show(ctx, |ui| self.settings_ui(ui, &mut st));
+            return;
+        }
+
         if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
             st.monitor = Some(m);
         }
@@ -237,106 +499,8 @@ impl eframe::App for Frog {
                 self.placed = Some(st.cfg.corner);
             }
         }
-        st.poll();
-        if st.quit || !st.visible() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        ctx.request_repaint_after(Duration::from_secs(1));
-
-        egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-            let side = FROG_PX as f32 * FROG_SCALE;
-            let frog_rect = egui::Rect::from_min_size(Pos2::new((W - side) / 2.0, H - side - 4.0), Vec2::splat(side));
-            let resp = ui.interact(frog_rect, ui.id().with("frog"), Sense::click());
-            let tex = self.frog.get_or_insert_with(|| {
-                let img = egui::ColorImage::from_rgba_unmultiplied([FROG_PX, FROG_PX], include_bytes!("../assets/frog.rgba"));
-                ctx.load_texture("frog", img, egui::TextureOptions::NEAREST)
-            });
-            ui.painter().image(tex.id(), frog_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-
-            // Bubble sits just above the frog and fits last frame's content size (one-frame lag when it changes).
-            let size = (self.bubble + Vec2::splat(20.0)).min(Vec2::new(W - 12.0, BUBBLE_BOTTOM));
-            let bubble = egui::Rect::from_min_size(Pos2::new((W - size.x) / 2.0, BUBBLE_BOTTOM - size.y), size);
-            let bg = ui.painter().add(egui::Shape::Noop);
-            let content = Rect::from_min_size(bubble.min + Vec2::splat(10.0), Vec2::new(W - 32.0, BUBBLE_BOTTOM));
-            let used = ui.allocate_ui_at_rect(content, |ui| {
-                ui.visuals_mut().override_text_color = Some(INK);
-                if let Some(tag) = st.update.clone() {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(10.0));
-                        ui.horizontal(|ui| {
-                            if ui.button("Yes").clicked() {
-                                match start_installer() {
-                                    Ok(()) => st.quit = true,
-                                    Err(e) => {
-                                        st.update = None;
-                                        st.message = Some(e);
-                                        st.shown_at = Instant::now();
-                                    }
-                                }
-                            }
-                            if ui.button("No").clicked() {
-                                st.update = None;
-                                st.hide();
-                            }
-                        });
-                    });
-                } else if st.settings {
-                    ui.label("Where should I sit?");
-                    egui::Grid::new("corners").show(ui, |ui| {
-                        for (i, name) in CORNERS.iter().enumerate() {
-                            if ui.selectable_label(st.cfg.corner == i, *name).clicked() {
-                                st.cfg.corner = i;
-                                st.cfg.save();
-                            }
-                            if i % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Every");
-                        if ui.add(egui::DragValue::new(&mut st.cfg.minutes).range(1..=240).suffix(" min")).changed() {
-                            st.cfg.save();
-                        }
-                    });
-                    if ui.checkbox(&mut st.cfg.european, "European units").changed() {
-                        st.cfg.save();
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Done").clicked() {
-                            st.hide();
-                        }
-                        if ui.button("Quit").clicked() {
-                            st.quit = true;
-                        }
-                    });
-                } else if let Some(m) = &st.message {
-                    ui.label(egui::RichText::new(m).size(10.0).line_height(Some(16.0)));
-                }
-                ui.min_rect().size()
-            })
-            .inner;
-            ui.painter().set(bg, egui::Shape::rect_filled(bubble, 0.0, Color32::from_rgb(252, 252, 240)));
-            ui.painter().rect_stroke(bubble, 0.0, Stroke::new(3.0, INK));
-            // pixel tail pointing at the frog
-            for (i, w) in [12.0, 6.0].into_iter().enumerate() {
-                let r = Rect::from_min_size(Pos2::new(W / 2.0 - w / 2.0, BUBBLE_BOTTOM + 1.5 + i as f32 * 4.0), Vec2::new(w, 4.0));
-                ui.painter().rect_filled(r, 0.0, INK);
-            }
-            if (used - self.bubble).length() > 0.5 {
-                self.bubble = used;
-                ctx.request_repaint();
-            }
-
-            if st.update.is_none() {
-                if resp.secondary_clicked() {
-                    st.settings = true;
-                } else if resp.clicked() && !st.settings {
-                    st.hide();
-                }
-            }
-        });
+        ctx.request_repaint_after(Duration::from_millis(50));
+        egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| self.frog_ui(ui, ctx, &mut st));
     }
 }
 
@@ -353,7 +517,7 @@ fn idle(st: &RefCell<State>) {
         }
         let mut s = st.borrow_mut();
         s.poll();
-        if s.quit || s.visible() {
+        if s.quit || s.settings || s.frog_visible() {
             return;
         }
         drop(s);
@@ -373,10 +537,10 @@ fn main() -> eframe::Result {
     }
 
     use tray_icon::menu::{Menu, MenuItem};
-    let show = MenuItem::new("Show", true, None);
+    let settings = MenuItem::new("Settings", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    let _ = menu.append_items(&[&show, &quit]);
+    let _ = menu.append_items(&[&settings, &quit]);
     let _tray = tray_icon::TrayIconBuilder::new()
         .with_tooltip("Frog Buddy")
         .with_menu(Box::new(menu))
@@ -391,12 +555,12 @@ fn main() -> eframe::Result {
     });
     let cfg = Config::load();
     let st = Rc::new(RefCell::new(State {
-        show_id: show.id().clone(),
+        settings_id: settings.id().clone(),
         quit_id: quit.id().clone(),
         update_rx: Some(rx),
         update: None,
         cfg,
-        message: Some("Hi! I'm your frog buddy. Right-click me for settings.".into()),
+        message: Some("Hi! I'm your frog buddy. Right-click my tray icon for settings.".into()),
         shown_at: Instant::now(),
         next_at: Instant::now() + Duration::from_secs(cfg.minutes as u64 * 60),
         settings: false,
@@ -406,18 +570,29 @@ fn main() -> eframe::Result {
     }));
 
     loop {
-        let mut vp = egui::ViewportBuilder::default()
-            .with_title("Frog Buddy")
-            .with_inner_size([W, H])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_resizable(false);
-        if let Some(p) = st.borrow().corner_pos() {
-            vp = vp.with_position(p);
-        }
-        let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
+        let settings_mode = st.borrow().settings;
+        let vp = if settings_mode {
+            egui::ViewportBuilder::default()
+                .with_title("Frog Buddy Settings")
+                .with_inner_size([380.0, 305.0])
+                .with_icon(egui::IconData { rgba: include_bytes!("../assets/frog.rgba").to_vec(), width: FROG_PX as u32, height: FROG_PX as u32 })
+                .with_resizable(false)
+                .with_maximize_button(false)
+        } else {
+            let mut vp = egui::ViewportBuilder::default()
+                .with_title("Frog Buddy")
+                .with_inner_size([W, H])
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_always_on_top()
+                .with_taskbar(false)
+                .with_resizable(false);
+            if let Some(p) = st.borrow().corner_pos() {
+                vp = vp.with_position(p);
+            }
+            vp
+        };
+        let opts = eframe::NativeOptions { viewport: vp, centered: settings_mode, ..Default::default() };
         let app_st = st.clone();
         eframe::run_native(
             "Frog Buddy",
@@ -425,12 +600,18 @@ fn main() -> eframe::Result {
             Box::new(move |cc| {
                 pixel_style(&cc.egui_ctx);
                 let placed = app_st.borrow().monitor.map(|_| app_st.borrow().cfg.corner);
-                Ok(Box::new(Frog { st: app_st, placed, bubble: Vec2::new(W - 32.0, 40.0), frog: None }))
+                Ok(Box::new(Frog { st: app_st, settings_mode, placed, bubble: Vec2::new(W - 32.0, 40.0), frog: None }))
             }),
         )?;
-        if st.borrow().quit {
+        let mut s = st.borrow_mut();
+        if s.quit {
             return Ok(());
         }
+        if settings_mode {
+            // closed with the title-bar X
+            s.settings = false;
+        }
+        drop(s);
         // Window and GL context are gone; hand the freed pages back to Windows.
         unsafe {
             use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
@@ -456,8 +637,8 @@ mod tests {
 
     #[test]
     fn config_parse() {
-        assert_eq!(Config::parse("corner=1\nminutes=15\nunits=european\n"), Config { corner: 1, minutes: 15, european: true });
-        assert_eq!(Config::parse("corner=9\nminutes=0\njunk"), Config { corner: 3, minutes: 1, european: false });
+        assert_eq!(Config::parse("corner=1\nminutes=15\nunits=european\n"), Config { corner: 1, minutes: 15, european: true, show_secs: 20 });
+        assert_eq!(Config::parse("corner=9\nminutes=0\njunk"), Config { corner: 3, minutes: 1, european: false, show_secs: 20 });
         assert_eq!(Config::parse(""), Config::default());
     }
 }

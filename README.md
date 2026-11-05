@@ -4,8 +4,8 @@ the frog is a buddy!
 A tiny Rust (egui) desktop frog that sits in a corner of your screen and pops up every so often to remind you to drink water, stretch, rest your eyes, etc.
 
 - Click the frog to dismiss a reminder.
-- Right-click the frog, or the tray icon > Show, for settings (screen corner, reminder interval, quit).
-- Lives in the system tray (right-click: Show / Quit). Only one copy runs at a time.
+- Right-click the tray icon > **Settings** for the settings window (corner, interval, how long tips stay up, European units, show a tip now, quit).
+- Lives in the system tray (right-click: Settings / Quit). Only one copy runs at a time.
 - Settings live in `%APPDATA%\FrogBuddy\config.txt`.
 - The installer adds a Start Menu shortcut and starts Frog Buddy with Windows.
 
@@ -28,4 +28,4 @@ GitHub Actions builds `frog-buddy.exe` and `frog-buddy.msi` and attaches them to
 
 ## Credits
 
-Pixel font: [Press Start 2P](https://fonts.google.com/specimen/Press+Start+2P), SIL Open Font License (see `assets/OFL.txt`).
+Pixel font: [Jersey 10](https://fonts.google.com/specimen/Jersey+10), SIL Open Font License (see `assets/OFL.txt`).
