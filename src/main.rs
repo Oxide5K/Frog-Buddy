@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use std::os::windows::process::CommandExt;
 use std::cell::RefCell;
 use std::process::Command;
@@ -15,6 +15,8 @@ const H: f32 = 230.0;
 const MARGIN: f32 = 12.0;
 // shortcut: fixed taskbar allowance instead of querying the real work area; upgrade if taskbar is moved/resized
 const TASKBAR: f32 = 48.0;
+// Bubble's bottom edge, just above the frog's eyes.
+const BUBBLE_BOTTOM: f32 = 124.0;
 const SHOW_FOR: Duration = Duration::from_secs(20);
 
 const REMINDERS: &[&str] = &[
@@ -174,6 +176,7 @@ impl State {
 struct Frog {
     st: Rc<RefCell<State>>,
     placed: Option<usize>,
+    bubble: Vec2,
 }
 
 fn draw_frog(p: &egui::Painter, c: Pos2) {
@@ -228,12 +231,15 @@ impl eframe::App for Frog {
             );
             draw_frog(ui.painter(), frog_c);
 
-            let bubble = egui::Rect::from_min_size(Pos2::new(6.0, 6.0), Vec2::new(W - 12.0, 114.0));
-            ui.painter().rect(bubble, 12.0, Color32::from_rgb(252, 252, 240), Stroke::new(2.0, Color32::from_rgb(50, 110, 40)));
-            ui.allocate_ui_at_rect(bubble.shrink(10.0), |ui| {
+            // Bubble sits just above the frog and fits last frame's content size (one-frame lag when it changes).
+            let size = (self.bubble + Vec2::splat(20.0)).min(Vec2::new(W - 12.0, BUBBLE_BOTTOM));
+            let bubble = egui::Rect::from_min_size(Pos2::new((W - size.x) / 2.0, BUBBLE_BOTTOM - size.y), size);
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let content = Rect::from_min_size(bubble.min + Vec2::splat(10.0), Vec2::new(W - 32.0, BUBBLE_BOTTOM));
+            let used = ui.allocate_ui_at_rect(content, |ui| {
                 ui.visuals_mut().override_text_color = Some(Color32::from_rgb(30, 40, 30));
                 if let Some(tag) = st.update.clone() {
-                    ui.vertical_centered(|ui| {
+                    ui.vertical(|ui| {
                         ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(15.0));
                         ui.horizontal(|ui| {
                             if ui.button("Yes").clicked() {
@@ -278,9 +284,17 @@ impl eframe::App for Frog {
                         }
                     });
                 } else if let Some(m) = &st.message {
-                    ui.vertical_centered(|ui| ui.label(egui::RichText::new(m).size(16.0)));
+                    ui.label(egui::RichText::new(m).size(16.0));
                 }
-            });
+                ui.min_rect().size()
+            })
+            .inner;
+            ui.painter().set(bg, egui::Shape::rect_filled(bubble, 12.0, Color32::from_rgb(252, 252, 240)));
+            ui.painter().rect_stroke(bubble, 12.0, Stroke::new(2.0, Color32::from_rgb(50, 110, 40)));
+            if (used - self.bubble).length() > 0.5 {
+                self.bubble = used;
+                ctx.request_repaint();
+            }
 
             if st.update.is_none() {
                 if resp.secondary_clicked() {
@@ -379,7 +393,7 @@ fn main() -> eframe::Result {
                 cc.egui_ctx.set_visuals(egui::Visuals::light());
                 cc.egui_ctx.style_mut(|s| s.text_styles.iter_mut().for_each(|(_, f)| f.size = f.size.max(15.0)));
                 let placed = app_st.borrow().monitor.map(|_| app_st.borrow().cfg.corner);
-                Ok(Box::new(Frog { st: app_st, placed }))
+                Ok(Box::new(Frog { st: app_st, placed, bubble: Vec2::new(W - 32.0, 40.0) }))
             }),
         )?;
         if st.borrow().quit {
