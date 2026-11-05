@@ -1,7 +1,12 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
+
+const RELEASES: &str = "https://github.com/Oxide5K/Frog-Buddy/releases/latest";
 
 const W: f32 = 240.0;
 const H: f32 = 230.0;
@@ -63,7 +68,54 @@ impl Config {
     }
 }
 
+fn hidden(exe: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
+fn ver(s: &str) -> Vec<u32> {
+    s.trim().trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+/// Latest release tag, if newer than this build.
+fn check_latest() -> Option<String> {
+    // /releases/latest redirects to /releases/tag/<tag>; reading the redirect skips the rate-limited JSON API
+    let out = hidden("curl.exe").args(["-sI", "-o", "NUL", "-w", "%{redirect_url}", RELEASES]).output().ok()?;
+    let url = String::from_utf8_lossy(&out.stdout);
+    let tag = url.rsplit_once("/tag/")?.1.trim().to_string();
+    (ver(&tag) > ver(env!("CARGO_PKG_VERSION"))).then_some(tag)
+}
+
+/// Downloads the latest MSI and starts a detached installer that relaunches the app; the caller must exit.
+fn start_installer() -> Result<(), String> {
+    let msi = std::env::temp_dir().join("frog-buddy-update.msi");
+    let ok = hidden("curl.exe")
+        .args(["-sfL", "-o"])
+        .arg(&msi)
+        .arg(format!("{RELEASES}/download/frog-buddy.msi"))
+        .status()
+        .map_err(|e| format!("Could not run curl: {e}"))?
+        .success();
+    if !ok {
+        return Err("Downloading the update failed.".into());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // cmd outlives us: waits for msiexec to replace the files, then reopens the app
+    hidden("cmd")
+        .arg("/c")
+        .raw_arg(format!("start /wait msiexec /i \"{}\" /passive & start \"\" \"{}\"", msi.display(), exe.display()))
+        .spawn()
+        .map_err(|e| format!("Could not start installer: {e}"))?;
+    Ok(())
+}
+
 struct Frog {
+    _tray: tray_icon::TrayIcon,
+    show_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+    update_rx: Option<Receiver<Option<String>>>,
+    update: Option<String>,
     cfg: Config,
     message: Option<String>,
     shown_at: Instant,
@@ -75,9 +127,34 @@ struct Frog {
 }
 
 impl Frog {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        cc.egui_ctx.style_mut(|s| s.text_styles.iter_mut().for_each(|(_, f)| f.size = f.size.max(15.0)));
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+        let show = MenuItem::new("Show", true, None);
+        let quit = MenuItem::new("Quit", true, None);
+        let menu = Menu::new();
+        let _ = menu.append_items(&[&show, &quit]);
+        let tray = tray_icon::TrayIconBuilder::new()
+            .with_tooltip("Frog Buddy")
+            .with_menu(Box::new(menu))
+            // id 1 is the exe icon embedded by winresource in build.rs
+            .with_icon(tray_icon::Icon::from_resource(1, None).expect("embedded icon"))
+            .build()
+            .expect("tray icon");
+        let ctx = cc.egui_ctx.clone();
+        MenuEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
         let cfg = Config::load();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_latest());
+        });
         Self {
+            _tray: tray,
+            show_id: show.id().clone(),
+            quit_id: quit.id().clone(),
+            update_rx: Some(rx),
+            update: None,
             cfg,
             message: Some("Hi! I'm your frog buddy. Right-click me for settings.".into()),
             shown_at: Instant::now(),
@@ -90,7 +167,7 @@ impl Frog {
     }
 
     fn visible(&self) -> bool {
-        self.message.is_some() || self.settings
+        self.message.is_some() || self.settings || self.update.is_some()
     }
 
     fn hide(&mut self) {
@@ -138,13 +215,27 @@ impl eframe::App for Frog {
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.place(ctx);
+        while let Ok(e) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if e.id == self.quit_id {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if e.id == self.show_id {
+                self.settings = true;
+            }
+        }
+        if let Some(Ok(tag)) = self.update_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.update_rx = None;
+            self.update = tag;
+            if self.update.is_some() {
+                self.settings = false;
+            }
+        }
         let now = Instant::now();
         if !self.visible() && now >= self.next_at {
             self.message = Some(REMINDERS[self.idx % REMINDERS.len()].into());
             self.idx += 1;
             self.shown_at = now;
         }
-        if self.message.is_some() && !self.settings && now - self.shown_at > SHOW_FOR {
+        if self.message.is_some() && !self.settings && self.update.is_none() && now - self.shown_at > SHOW_FOR {
             self.hide();
         }
         // Idle: invisible window lets clicks fall through to whatever is underneath.
@@ -171,7 +262,27 @@ impl eframe::App for Frog {
             ui.painter().rect(bubble, 12.0, Color32::from_rgb(252, 252, 240), Stroke::new(2.0, Color32::from_rgb(50, 110, 40)));
             ui.allocate_ui_at_rect(bubble.shrink(10.0), |ui| {
                 ui.visuals_mut().override_text_color = Some(Color32::from_rgb(30, 40, 30));
-                if self.settings {
+                if let Some(tag) = self.update.clone() {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(15.0));
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes").clicked() {
+                                match start_installer() {
+                                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                                    Err(e) => {
+                                        self.update = None;
+                                        self.message = Some(e);
+                                        self.shown_at = Instant::now();
+                                    }
+                                }
+                            }
+                            if ui.button("No").clicked() {
+                                self.update = None;
+                                self.hide();
+                            }
+                        });
+                    });
+                } else if self.settings {
                     ui.label("Where should I sit?");
                     egui::Grid::new("corners").show(ui, |ui| {
                         for (i, name) in CORNERS.iter().enumerate() {
@@ -201,7 +312,8 @@ impl eframe::App for Frog {
                 }
             });
 
-            if resp.secondary_clicked() {
+            if self.update.is_some() {
+            } else if resp.secondary_clicked() {
                 self.settings = true;
             } else if resp.clicked() && !self.settings {
                 self.hide();
@@ -211,6 +323,15 @@ impl eframe::App for Frog {
 }
 
 fn main() -> eframe::Result {
+    // Named mutex lives until the process exits; a second launch sees it and quits.
+    let name: Vec<u16> = "Local\\FrogBuddySingleInstance\0".encode_utf16().collect();
+    unsafe {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return Ok(());
+        }
+    }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Frog Buddy")
@@ -222,12 +343,19 @@ fn main() -> eframe::Result {
             .with_resizable(false),
         ..Default::default()
     };
-    eframe::run_native("Frog Buddy", opts, Box::new(|_| Ok(Box::new(Frog::new()))))
+    eframe::run_native("Frog Buddy", opts, Box::new(|cc| Ok(Box::new(Frog::new(cc)))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_compare() {
+        assert!(ver("v1.0.1") > ver("1.0.0"));
+        assert!(ver("v1.10.0") > ver("1.9.9"));
+        assert!(ver("v1.0.0") <= ver("1.0.0"));
+    }
 
     #[test]
     fn config_parse() {
