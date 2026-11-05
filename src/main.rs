@@ -2,7 +2,9 @@
 
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use std::os::windows::process::CommandExt;
+use std::cell::RefCell;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -110,8 +112,7 @@ fn start_installer() -> Result<(), String> {
     Ok(())
 }
 
-struct Frog {
-    _tray: tray_icon::TrayIcon,
+struct State {
     show_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
     update_rx: Option<Receiver<Option<String>>>,
@@ -121,51 +122,12 @@ struct Frog {
     shown_at: Instant,
     next_at: Instant,
     settings: bool,
-    placed: Option<usize>,
-    passthrough: Option<bool>,
     idx: usize,
+    quit: bool,
+    monitor: Option<Vec2>,
 }
 
-impl Frog {
-    fn new(cc: &eframe::CreationContext) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
-        cc.egui_ctx.style_mut(|s| s.text_styles.iter_mut().for_each(|(_, f)| f.size = f.size.max(15.0)));
-        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-        let show = MenuItem::new("Show", true, None);
-        let quit = MenuItem::new("Quit", true, None);
-        let menu = Menu::new();
-        let _ = menu.append_items(&[&show, &quit]);
-        let tray = tray_icon::TrayIconBuilder::new()
-            .with_tooltip("Frog Buddy")
-            .with_menu(Box::new(menu))
-            // id 1 is the exe icon embedded by winresource in build.rs
-            .with_icon(tray_icon::Icon::from_resource(1, None).expect("embedded icon"))
-            .build()
-            .expect("tray icon");
-        let ctx = cc.egui_ctx.clone();
-        MenuEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
-        let cfg = Config::load();
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(check_latest());
-        });
-        Self {
-            _tray: tray,
-            show_id: show.id().clone(),
-            quit_id: quit.id().clone(),
-            update_rx: Some(rx),
-            update: None,
-            cfg,
-            message: Some("Hi! I'm your frog buddy. Right-click me for settings.".into()),
-            shown_at: Instant::now(),
-            next_at: Instant::now() + Duration::from_secs(cfg.minutes as u64 * 60),
-            settings: false,
-            placed: None,
-            passthrough: None,
-            idx: 0,
-        }
-    }
-
+impl State {
     fn visible(&self) -> bool {
         self.message.is_some() || self.settings || self.update.is_some()
     }
@@ -176,16 +138,42 @@ impl Frog {
         self.next_at = Instant::now() + Duration::from_secs(self.cfg.minutes as u64 * 60);
     }
 
-    fn place(&mut self, ctx: &egui::Context) {
-        if self.placed == Some(self.cfg.corner) {
-            return;
+    /// Handles tray clicks, update results and due reminders; shared by the window and the idle loop.
+    fn poll(&mut self) {
+        while let Ok(e) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if e.id == self.quit_id {
+                self.quit = true;
+            } else if e.id == self.show_id {
+                self.settings = true;
+            }
         }
-        let Some(m) = ctx.input(|i| i.viewport().monitor_size) else { return };
+        if let Some(Ok(tag)) = self.update_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.update_rx = None;
+            self.update = tag;
+        }
+        let now = Instant::now();
+        if !self.visible() && now >= self.next_at {
+            self.message = Some(REMINDERS[self.idx % REMINDERS.len()].into());
+            self.idx += 1;
+            self.shown_at = now;
+        }
+        if self.message.is_some() && !self.settings && self.update.is_none() && now - self.shown_at > SHOW_FOR {
+            self.hide();
+        }
+    }
+
+    fn corner_pos(&self) -> Option<Pos2> {
+        let m = self.monitor?;
         let x = if self.cfg.corner % 2 == 0 { MARGIN } else { m.x - W - MARGIN };
         let y = if self.cfg.corner < 2 { MARGIN } else { m.y - H - MARGIN - TASKBAR };
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, y)));
-        self.placed = Some(self.cfg.corner);
+        Some(Pos2::new(x, y))
     }
+}
+
+/// One on-screen session; the window is destroyed as soon as there is nothing to show.
+struct Frog {
+    st: Rc<RefCell<State>>,
+    placed: Option<usize>,
 }
 
 fn draw_frog(p: &egui::Painter, c: Pos2) {
@@ -214,42 +202,24 @@ impl eframe::App for Frog {
     }
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.place(ctx);
-        while let Ok(e) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if e.id == self.quit_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if e.id == self.show_id {
-                self.settings = true;
+        let mut st = self.st.borrow_mut();
+        if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+            st.monitor = Some(m);
+        }
+        if self.placed != Some(st.cfg.corner) {
+            if let Some(p) = st.corner_pos() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
+                self.placed = Some(st.cfg.corner);
             }
         }
-        if let Some(Ok(tag)) = self.update_rx.as_ref().map(|rx| rx.try_recv()) {
-            self.update_rx = None;
-            self.update = tag;
-            if self.update.is_some() {
-                self.settings = false;
-            }
-        }
-        let now = Instant::now();
-        if !self.visible() && now >= self.next_at {
-            self.message = Some(REMINDERS[self.idx % REMINDERS.len()].into());
-            self.idx += 1;
-            self.shown_at = now;
-        }
-        if self.message.is_some() && !self.settings && self.update.is_none() && now - self.shown_at > SHOW_FOR {
-            self.hide();
-        }
-        // Idle: invisible window lets clicks fall through to whatever is underneath.
-        let pass = !self.visible();
-        if self.passthrough != Some(pass) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(pass));
-            self.passthrough = Some(pass);
+        st.poll();
+        if st.quit || !st.visible() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
         ctx.request_repaint_after(Duration::from_secs(1));
 
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-            if !self.visible() {
-                return;
-            }
             let frog_c = Pos2::new(W / 2.0, H - 50.0);
             let resp = ui.interact(
                 egui::Rect::from_center_size(frog_c, Vec2::splat(100.0)),
@@ -262,33 +232,33 @@ impl eframe::App for Frog {
             ui.painter().rect(bubble, 12.0, Color32::from_rgb(252, 252, 240), Stroke::new(2.0, Color32::from_rgb(50, 110, 40)));
             ui.allocate_ui_at_rect(bubble.shrink(10.0), |ui| {
                 ui.visuals_mut().override_text_color = Some(Color32::from_rgb(30, 40, 30));
-                if let Some(tag) = self.update.clone() {
+                if let Some(tag) = st.update.clone() {
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(15.0));
                         ui.horizontal(|ui| {
                             if ui.button("Yes").clicked() {
                                 match start_installer() {
-                                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                                    Ok(()) => st.quit = true,
                                     Err(e) => {
-                                        self.update = None;
-                                        self.message = Some(e);
-                                        self.shown_at = Instant::now();
+                                        st.update = None;
+                                        st.message = Some(e);
+                                        st.shown_at = Instant::now();
                                     }
                                 }
                             }
                             if ui.button("No").clicked() {
-                                self.update = None;
-                                self.hide();
+                                st.update = None;
+                                st.hide();
                             }
                         });
                     });
-                } else if self.settings {
+                } else if st.settings {
                     ui.label("Where should I sit?");
                     egui::Grid::new("corners").show(ui, |ui| {
                         for (i, name) in CORNERS.iter().enumerate() {
-                            if ui.selectable_label(self.cfg.corner == i, *name).clicked() {
-                                self.cfg.corner = i;
-                                self.cfg.save();
+                            if ui.selectable_label(st.cfg.corner == i, *name).clicked() {
+                                st.cfg.corner = i;
+                                st.cfg.save();
                             }
                             if i % 2 == 1 {
                                 ui.end_row();
@@ -297,28 +267,50 @@ impl eframe::App for Frog {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Every");
-                        if ui.add(egui::DragValue::new(&mut self.cfg.minutes).range(1..=240).suffix(" min")).changed() {
-                            self.cfg.save();
+                        if ui.add(egui::DragValue::new(&mut st.cfg.minutes).range(1..=240).suffix(" min")).changed() {
+                            st.cfg.save();
                         }
                         if ui.button("Done").clicked() {
-                            self.hide();
+                            st.hide();
                         }
                         if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            st.quit = true;
                         }
                     });
-                } else if let Some(m) = &self.message {
+                } else if let Some(m) = &st.message {
                     ui.vertical_centered(|ui| ui.label(egui::RichText::new(m).size(16.0)));
                 }
             });
 
-            if self.update.is_some() {
-            } else if resp.secondary_clicked() {
-                self.settings = true;
-            } else if resp.clicked() && !self.settings {
-                self.hide();
+            if st.update.is_none() {
+                if resp.secondary_clicked() {
+                    st.settings = true;
+                } else if resp.clicked() && !st.settings {
+                    st.hide();
+                }
             }
         });
+    }
+}
+
+/// Sleeps until there is something to show, pumping Win32 messages so the tray keeps working.
+fn idle(st: &RefCell<State>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    loop {
+        unsafe {
+            let mut msg = std::mem::zeroed();
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        let mut s = st.borrow_mut();
+        s.poll();
+        if s.quit || s.visible() {
+            return;
+        }
+        drop(s);
+        unsafe { MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 1000, QS_ALLINPUT) };
     }
 }
 
@@ -332,18 +324,77 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+
+    use tray_icon::menu::{Menu, MenuItem};
+    let show = MenuItem::new("Show", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    let menu = Menu::new();
+    let _ = menu.append_items(&[&show, &quit]);
+    let _tray = tray_icon::TrayIconBuilder::new()
+        .with_tooltip("Frog Buddy")
+        .with_menu(Box::new(menu))
+        // id 1 is the exe icon embedded by winresource in build.rs
+        .with_icon(tray_icon::Icon::from_resource(1, None).expect("embedded icon"))
+        .build()
+        .expect("tray icon");
+
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(check_latest());
+    });
+    let cfg = Config::load();
+    let st = Rc::new(RefCell::new(State {
+        show_id: show.id().clone(),
+        quit_id: quit.id().clone(),
+        update_rx: Some(rx),
+        update: None,
+        cfg,
+        message: Some("Hi! I'm your frog buddy. Right-click me for settings.".into()),
+        shown_at: Instant::now(),
+        next_at: Instant::now() + Duration::from_secs(cfg.minutes as u64 * 60),
+        settings: false,
+        idx: 0,
+        quit: false,
+        monitor: None,
+    }));
+
+    loop {
+        let mut vp = egui::ViewportBuilder::default()
             .with_title("Frog Buddy")
             .with_inner_size([W, H])
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
             .with_taskbar(false)
-            .with_resizable(false),
-        ..Default::default()
-    };
-    eframe::run_native("Frog Buddy", opts, Box::new(|cc| Ok(Box::new(Frog::new(cc)))))
+            .with_resizable(false);
+        if let Some(p) = st.borrow().corner_pos() {
+            vp = vp.with_position(p);
+        }
+        let opts = eframe::NativeOptions { viewport: vp, ..Default::default() };
+        let app_st = st.clone();
+        eframe::run_native(
+            "Frog Buddy",
+            opts,
+            Box::new(move |cc| {
+                cc.egui_ctx.set_visuals(egui::Visuals::light());
+                cc.egui_ctx.style_mut(|s| s.text_styles.iter_mut().for_each(|(_, f)| f.size = f.size.max(15.0)));
+                let placed = app_st.borrow().monitor.map(|_| app_st.borrow().cfg.corner);
+                Ok(Box::new(Frog { st: app_st, placed }))
+            }),
+        )?;
+        if st.borrow().quit {
+            return Ok(());
+        }
+        // Window and GL context are gone; hand the freed pages back to Windows.
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+            SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
+        idle(&st);
+        if st.borrow().quit {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
