@@ -1,0 +1,15 @@
+[package]
+name = "frog-buddy"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"
+
+[build-dependencies]
+winresource = "0.1"

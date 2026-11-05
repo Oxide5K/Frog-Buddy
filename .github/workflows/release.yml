@@ -1,0 +1,24 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet tool install --global wix --version 5.0.2
+      - run: wix build installer.wxs -d Version=$("${{ github.ref_name }}".TrimStart('v')) -arch x64 -o frog-buddy.msi
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            frog-buddy.msi
+            target/release/frog-buddy.exe
+          generate_release_notes: true

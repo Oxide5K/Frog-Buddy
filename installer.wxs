@@ -1,0 +1,35 @@
+<!-- Build: wix build installer.wxs -d Version=X.Y.Z -arch x64 -o frog-buddy.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Frog Buddy" Manufacturer="Oxide5K" Version="$(Version)"
+           UpgradeCode="3B9E7C41-2D6A-4F18-A5C3-8E1D0F6B2A97" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Frog Buddy is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Frog Buddy">
+        <Component Id="App">
+          <File Id="AppExe" Source="target\release\frog-buddy.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenu">
+        <Shortcut Id="StartMenuShortcut" Name="Frog Buddy" Target="[#AppExe]" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        <RegistryValue Root="HKLM" Key="Software\Oxide5K\Frog Buddy" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <!-- Start with Windows so reminders keep coming -->
+      <Component Id="AutoStart">
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Frog Buddy" Type="string" Value="&quot;[#AppExe]&quot;" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="StartMenu" />
+      <ComponentRef Id="AutoStart" />
+    </Feature>
+  </Package>
+</Wix>
