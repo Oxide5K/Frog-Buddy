@@ -25,3 +25,7 @@ git push origin v1.0.0
 ```
 
 GitHub Actions builds `frog-buddy.exe` and `frog-buddy.msi` and attaches them to a new GitHub Release.
+
+## Credits
+
+Pixel font: [Press Start 2P](https://fonts.google.com/specimen/Press+Start+2P), SIL Open Font License (see `assets/OFL.txt`).

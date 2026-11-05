@@ -10,23 +10,27 @@ use std::time::{Duration, Instant};
 
 const RELEASES: &str = "https://github.com/Oxide5K/Frog-Buddy/releases/latest";
 
-const W: f32 = 240.0;
-const H: f32 = 230.0;
+const W: f32 = 280.0;
+const H: f32 = 270.0;
 const MARGIN: f32 = 12.0;
 // shortcut: fixed taskbar allowance instead of querying the real work area; upgrade if taskbar is moved/resized
 const TASKBAR: f32 = 48.0;
 // Bubble's bottom edge, just above the frog's eyes.
-const BUBBLE_BOTTOM: f32 = 124.0;
+const BUBBLE_BOTTOM: f32 = H - 104.0;
 const SHOW_FOR: Duration = Duration::from_secs(20);
 
-const REMINDERS: &[&str] = &[
-    "Ribbit! Time for a sip of water.",
-    "Stand up and stretch those legs!",
-    "Look at something 20 feet away for 20 seconds.",
-    "Check your posture, friend.",
-    "Take three deep breaths.",
-    "Blink a few times, your eyes will thank you.",
-    "Hydration check! Drink some water.",
+// (US wording, European wording)
+const REMINDERS: &[(&str, &str)] = &[
+    ("Ribbit! Time for a glass of water (8 oz).", "Ribbit! Time for a glass of water (250 ml)."),
+    ("Stand up and stretch those legs!", "Stand up and stretch those legs!"),
+    ("Look at something 20 feet away for 20 seconds.", "Look at something 6 metres away for 20 seconds."),
+    ("Check your posture, friend.", "Check your posture, friend."),
+    ("Take three deep breaths.", "Take three deep breaths."),
+    ("Blink a few times, your eyes will thank you.", "Blink a few times, your eyes will thank you."),
+    ("Go for a short walk, even 100 yards helps.", "Go for a short walk, even 100 metres helps."),
+    ("Keep your screen about an arm's length (25 in) away.", "Keep your screen about an arm's length (65 cm) away."),
+    ("Hydration check! Aim for about 2 quarts a day.", "Hydration check! Aim for about 2 litres a day."),
+    ("Grab a snack? An apple beats a candy bar.", "Grab a snack? An apple beats a chocolate bar."),
 ];
 
 const CORNERS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom right"];
@@ -35,11 +39,12 @@ const CORNERS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom righ
 struct Config {
     corner: usize,
     minutes: u32,
+    european: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { corner: 3, minutes: 30 }
+        Self { corner: 3, minutes: 30, european: false }
     }
 }
 
@@ -50,6 +55,7 @@ impl Config {
             match line.split_once('=') {
                 Some(("corner", v)) => c.corner = v.trim().parse().unwrap_or(c.corner).min(3),
                 Some(("minutes", v)) => c.minutes = v.trim().parse().unwrap_or(c.minutes).clamp(1, 240),
+                Some(("units", v)) => c.european = v.trim() == "european",
                 _ => {}
             }
         }
@@ -67,7 +73,12 @@ impl Config {
     fn save(&self) {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let _ = std::fs::write(p, format!("corner={}\nminutes={}\n", self.corner, self.minutes));
+            let _ = std::fs::write(p, format!(
+                "corner={}\nminutes={}\nunits={}\n",
+                self.corner,
+                self.minutes,
+                if self.european { "european" } else { "us" }
+            ));
         }
     }
 }
@@ -155,7 +166,8 @@ impl State {
         }
         let now = Instant::now();
         if !self.visible() && now >= self.next_at {
-            self.message = Some(REMINDERS[self.idx % REMINDERS.len()].into());
+            let (us, eu) = REMINDERS[self.idx % REMINDERS.len()];
+            self.message = Some(if self.cfg.european { eu } else { us }.into());
             self.idx += 1;
             self.shown_at = now;
         }
@@ -177,26 +189,36 @@ struct Frog {
     st: Rc<RefCell<State>>,
     placed: Option<usize>,
     bubble: Vec2,
+    frog: Option<egui::TextureHandle>,
 }
 
-fn draw_frog(p: &egui::Painter, c: Pos2) {
-    let green = Color32::from_rgb(88, 170, 70);
-    let dark = Color32::from_rgb(50, 110, 40);
-    p.circle(c, 42.0, green, Stroke::new(2.0, dark));
-    for dx in [-22.0, 22.0] {
-        let e = c + Vec2::new(dx, -34.0);
-        p.circle(e, 15.0, green, Stroke::new(2.0, dark));
-        p.circle_filled(e, 9.0, Color32::WHITE);
-        p.circle_filled(e + Vec2::new(0.0, 1.5), 5.0, Color32::BLACK);
-        p.circle_filled(c + Vec2::new(dx * 1.2, 8.0), 6.0, Color32::from_rgb(240, 140, 150));
+// 22x22 RGBA sprite cut from the frog art (assets/frog.png is the same image).
+const FROG_PX: usize = 22;
+const FROG_SCALE: f32 = 4.0;
+const INK: Color32 = Color32::BLACK;
+
+fn pixel_style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("pixel".into(), egui::FontData::from_static(include_bytes!("../assets/PressStart2P-Regular.ttf")));
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.get_mut(&fam).unwrap().insert(0, "pixel".into());
     }
-    let mouth: Vec<Pos2> = (0..=12)
-        .map(|i| {
-            let t = std::f32::consts::PI * (0.15 + 0.7 * i as f32 / 12.0);
-            c + Vec2::new(-22.0 * t.cos(), 2.0 + 14.0 * t.sin())
-        })
-        .collect();
-    p.add(egui::Shape::line(mouth, Stroke::new(3.0, dark)));
+    ctx.set_fonts(fonts);
+    ctx.set_visuals(egui::Visuals::light());
+    ctx.style_mut(|s| {
+        s.text_styles.iter_mut().for_each(|(_, f)| f.size = 9.0);
+        s.spacing.item_spacing = Vec2::new(6.0, 7.0);
+        let w = &mut s.visuals.widgets;
+        for v in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            v.rounding = egui::Rounding::ZERO;
+        }
+        w.inactive.bg_stroke = Stroke::new(2.0, INK);
+        w.hovered.bg_stroke = Stroke::new(2.0, INK);
+        w.inactive.weak_bg_fill = Color32::from_rgb(200, 230, 120);
+        w.hovered.weak_bg_fill = Color32::from_rgb(170, 215, 80);
+        s.visuals.selection.bg_fill = Color32::from_rgb(110, 190, 60);
+        s.visuals.selection.stroke = Stroke::new(1.0, INK);
+    });
 }
 
 impl eframe::App for Frog {
@@ -223,13 +245,14 @@ impl eframe::App for Frog {
         ctx.request_repaint_after(Duration::from_secs(1));
 
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-            let frog_c = Pos2::new(W / 2.0, H - 50.0);
-            let resp = ui.interact(
-                egui::Rect::from_center_size(frog_c, Vec2::splat(100.0)),
-                ui.id().with("frog"),
-                Sense::click(),
-            );
-            draw_frog(ui.painter(), frog_c);
+            let side = FROG_PX as f32 * FROG_SCALE;
+            let frog_rect = egui::Rect::from_min_size(Pos2::new((W - side) / 2.0, H - side - 4.0), Vec2::splat(side));
+            let resp = ui.interact(frog_rect, ui.id().with("frog"), Sense::click());
+            let tex = self.frog.get_or_insert_with(|| {
+                let img = egui::ColorImage::from_rgba_unmultiplied([FROG_PX, FROG_PX], include_bytes!("../assets/frog.rgba"));
+                ctx.load_texture("frog", img, egui::TextureOptions::NEAREST)
+            });
+            ui.painter().image(tex.id(), frog_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
             // Bubble sits just above the frog and fits last frame's content size (one-frame lag when it changes).
             let size = (self.bubble + Vec2::splat(20.0)).min(Vec2::new(W - 12.0, BUBBLE_BOTTOM));
@@ -237,10 +260,10 @@ impl eframe::App for Frog {
             let bg = ui.painter().add(egui::Shape::Noop);
             let content = Rect::from_min_size(bubble.min + Vec2::splat(10.0), Vec2::new(W - 32.0, BUBBLE_BOTTOM));
             let used = ui.allocate_ui_at_rect(content, |ui| {
-                ui.visuals_mut().override_text_color = Some(Color32::from_rgb(30, 40, 30));
+                ui.visuals_mut().override_text_color = Some(INK);
                 if let Some(tag) = st.update.clone() {
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(15.0));
+                        ui.label(egui::RichText::new(format!("Ribbit! Frog Buddy {tag} is out. Update now?")).size(10.0));
                         ui.horizontal(|ui| {
                             if ui.button("Yes").clicked() {
                                 match start_installer() {
@@ -276,6 +299,11 @@ impl eframe::App for Frog {
                         if ui.add(egui::DragValue::new(&mut st.cfg.minutes).range(1..=240).suffix(" min")).changed() {
                             st.cfg.save();
                         }
+                    });
+                    if ui.checkbox(&mut st.cfg.european, "European units").changed() {
+                        st.cfg.save();
+                    }
+                    ui.horizontal(|ui| {
                         if ui.button("Done").clicked() {
                             st.hide();
                         }
@@ -284,13 +312,18 @@ impl eframe::App for Frog {
                         }
                     });
                 } else if let Some(m) = &st.message {
-                    ui.label(egui::RichText::new(m).size(16.0));
+                    ui.label(egui::RichText::new(m).size(10.0).line_height(Some(16.0)));
                 }
                 ui.min_rect().size()
             })
             .inner;
-            ui.painter().set(bg, egui::Shape::rect_filled(bubble, 12.0, Color32::from_rgb(252, 252, 240)));
-            ui.painter().rect_stroke(bubble, 12.0, Stroke::new(2.0, Color32::from_rgb(50, 110, 40)));
+            ui.painter().set(bg, egui::Shape::rect_filled(bubble, 0.0, Color32::from_rgb(252, 252, 240)));
+            ui.painter().rect_stroke(bubble, 0.0, Stroke::new(3.0, INK));
+            // pixel tail pointing at the frog
+            for (i, w) in [12.0, 6.0].into_iter().enumerate() {
+                let r = Rect::from_min_size(Pos2::new(W / 2.0 - w / 2.0, BUBBLE_BOTTOM + 1.5 + i as f32 * 4.0), Vec2::new(w, 4.0));
+                ui.painter().rect_filled(r, 0.0, INK);
+            }
             if (used - self.bubble).length() > 0.5 {
                 self.bubble = used;
                 ctx.request_repaint();
@@ -390,10 +423,9 @@ fn main() -> eframe::Result {
             "Frog Buddy",
             opts,
             Box::new(move |cc| {
-                cc.egui_ctx.set_visuals(egui::Visuals::light());
-                cc.egui_ctx.style_mut(|s| s.text_styles.iter_mut().for_each(|(_, f)| f.size = f.size.max(15.0)));
+                pixel_style(&cc.egui_ctx);
                 let placed = app_st.borrow().monitor.map(|_| app_st.borrow().cfg.corner);
-                Ok(Box::new(Frog { st: app_st, placed, bubble: Vec2::new(W - 32.0, 40.0) }))
+                Ok(Box::new(Frog { st: app_st, placed, bubble: Vec2::new(W - 32.0, 40.0), frog: None }))
             }),
         )?;
         if st.borrow().quit {
@@ -424,8 +456,8 @@ mod tests {
 
     #[test]
     fn config_parse() {
-        assert_eq!(Config::parse("corner=1\nminutes=15\n"), Config { corner: 1, minutes: 15 });
-        assert_eq!(Config::parse("corner=9\nminutes=0\njunk"), Config { corner: 3, minutes: 1 });
+        assert_eq!(Config::parse("corner=1\nminutes=15\nunits=european\n"), Config { corner: 1, minutes: 15, european: true });
+        assert_eq!(Config::parse("corner=9\nminutes=0\njunk"), Config { corner: 3, minutes: 1, european: false });
         assert_eq!(Config::parse(""), Config::default());
     }
 }
